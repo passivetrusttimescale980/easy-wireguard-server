@@ -1,0 +1,7 @@
+#pragma once
+#define IDI_EASYWG 101
+#define IDI_QUICK_ADD_USER 111
+#define IDI_QUICK_QR 112
+#define IDI_QUICK_EXPORT 113
+#define IDI_QUICK_BACKUP 114
+#define IDR_MAIN_MANIFEST 1

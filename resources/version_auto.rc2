@@ -1,0 +1,31 @@
+/* Auto-generated from ver.txt by tools/gen_version.ps1. Do not edit manually. */
+1 VERSIONINFO
+ FILEVERSION 0,4,7,0
+ PRODUCTVERSION 0,4,7,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Terence0816\0"
+            VALUE "FileDescription", "EasyWG Server - Lightweight Windows WireGuard VPN Server\0"
+            VALUE "FileVersion", "0.4.7.0\0"
+            VALUE "InternalName", "EasyWG_Server\0"
+            VALUE "LegalCopyright", "Copyright (C) 2026 Terence0816\0"
+            VALUE "OriginalFilename", "EasyWG_Server.exe\0"
+            VALUE "ProductName", "EasyWG Server\0"
+            VALUE "ProductVersion", "0.4.7\0"
+            VALUE "Comments", "Native C++ / Win32 / WireGuardNT / Native NAT-PAT / Host Alias\0"
+            VALUE "ProjectURL", "https://github.com/Terence0816/easy-wireguard-server\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

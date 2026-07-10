@@ -1,0 +1,9 @@
+#include "resource.h"
+IDR_MAIN_MANIFEST 24 "resources\\EasyWG_Server.manifest"
+IDI_EASYWG ICON "resources\\EasyWG.ico"
+IDI_QUICK_ADD_USER ICON "resources\\quick_add_user.ico"
+IDI_QUICK_QR ICON "resources\\quick_qr.ico"
+IDI_QUICK_EXPORT ICON "resources\\quick_export.ico"
+IDI_QUICK_BACKUP ICON "resources\\quick_backup.ico"
+
+#include "version_auto.rc2"
