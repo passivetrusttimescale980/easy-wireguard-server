@@ -7,7 +7,7 @@ Ultra-lightweight native Windows GUI for creating and managing a WireGuard VPN s
 ![Windows](https://img.shields.io/badge/Windows-7%20%7C%2010%20%7C%2011-0078D6?logo=windows&logoColor=white)
 
 [Releases](https://github.com/Terence0816/easy-wireguard-server/releases) |
-[Latest Official Build `v0.4.7`](https://github.com/Terence0816/easy-wireguard-server/releases/tag/v0.4.7) |
+[Latest Official Build `v0.4.9`](https://github.com/Terence0816/easy-wireguard-server/releases/tag/v0.4.9) |
 [PolyForm Shield License 1.0.0](./LICENSE)
 
 English | [繁體中文](#繁體中文)
@@ -24,9 +24,22 @@ The main application is written in **native C++ / Win32 x64** and supports **Win
 
 > This repository is **source-available** under the PolyForm Shield License 1.0.0. See [LICENSE](./LICENSE) for the exact terms.
 
-## Latest Release — v0.4.7
+## Latest Release — v0.4.9
 
-The initial public release provides a complete Windows WireGuard server workflow with multi-peer management, QR Code onboarding, Native NAT/PAT, Host Alias access, Windows 7 Legacy compatibility, and real-time peer statistics.
+Version 0.4.9 adds per-user Internet routing control and makes the lower-left service controls fully operational on every page.
+
+### What's New
+
+- Per-user Internet routing option when adding a peer
+  - Enabled: routes all IPv4 traffic through the VPN server with `AllowedIPs = 0.0.0.0/0`
+  - Disabled: allows access only to the VPN and private LAN networks while keeping the client's normal Internet connection
+- Working lower-left sidebar service controls on every page
+  - Start Service
+  - Stop Service
+  - Restart Service
+- Native NAT/PAT now supports full-tunnel Internet access through the EasyWG Server computer
+- Fixed the clipped `VPN IP last octet` label in the Add User panel
+- Existing configuration files remain compatible
 
 ### Highlights
 
@@ -34,12 +47,14 @@ The initial public release provides a complete Windows WireGuard server workflow
 - Ultra-lightweight main executable
 - Windows 7 SP1 / 10 / 11 x64 support
 - Multi-peer / multi-user VPN management
-- One-click server start and stop
+- Per-user LAN-only or full-tunnel Internet routing
+- One-click server start, stop, and restart
 - Local WireGuard key generation
 - Local QR Code generation
 - Individual peer `.conf` export
 - Peer edit / export / QR Code / delete actions
 - Native NAT/PAT for VPN-to-LAN access
+- Native NAT/PAT for full-tunnel Internet access
 - Host Alias NAT for access to the server host's own LAN IP
 - No router static route required for LAN access
 - Automatic LAN and public network information detection
@@ -72,6 +87,46 @@ The dashboard provides a real-time overview of the VPN server, traffic statistic
 The settings page provides server, startup, language, theme, tray, and related application options.
 
 ![EasyWG Server English Settings](assets/screenshots/settings-en.png)
+
+## Per-User Internet Routing
+
+Each peer can independently choose whether Internet traffic should use the EasyWG Server computer as its gateway.
+
+### LAN-Only Mode
+
+When the Internet routing option is not selected, the exported configuration includes only the VPN subnet and configured private LAN subnet.
+
+Example:
+
+```ini
+AllowedIPs = 192.168.11.0/24, 10.66.66.0/24
+```
+
+The peer can access VPN and LAN resources, while normal Internet traffic continues to use the client's original network connection.
+
+### Full-Tunnel Mode
+
+When the Internet routing option is selected, the exported configuration uses:
+
+```ini
+AllowedIPs = 0.0.0.0/0
+```
+
+The peer's IPv4 Internet traffic is routed through the VPN server and translated by EasyWG Native NAT/PAT before leaving through the server computer's normal LAN gateway.
+
+```text
+VPN Client
+   ↓
+WireGuard Tunnel
+   ↓
+EasyWG Native NAT/PAT
+   ↓
+EasyWG Server LAN Interface
+   ↓
+Router / Internet
+```
+
+The routing mode is stored separately for each peer.
 
 ## Windows Core Architecture
 
@@ -167,6 +222,7 @@ Each peer can have its own:
 - Private Key
 - Public Key
 - Preshared Key
+- LAN-only or full-tunnel routing mode
 - Exported `.conf` configuration
 - Locally generated QR Code
 
@@ -192,10 +248,10 @@ This is useful for quickly adding phones, tablets, laptops, and other WireGuard 
 3. Allow Administrator privileges when requested.
 4. On first launch, missing runtime components are obtained automatically when required.
 5. Configure the VPN subnet, UDP listen port, and public IP / DDNS information.
-6. Add a new peer.
+6. Add a new peer and choose whether it should use the VPN server for Internet access.
 7. Scan the generated QR Code with the WireGuard mobile app, or export the peer `.conf` file.
 8. Start the server.
-9. For Internet access, forward the configured UDP listen port from your router to the EasyWG Server LAN IP.
+9. For remote connections from outside your LAN, forward the configured UDP listen port from your router to the EasyWG Server LAN IP.
 
 ## External Internet Access
 
@@ -220,6 +276,8 @@ UDP 51820
 ```
 
 A public IP address or DDNS hostname can be used in exported peer configurations.
+
+> Router port forwarding is used for remote clients to reach the VPN server. The per-user full-tunnel option controls whether a connected peer also uses the VPN server as its Internet gateway.
 
 ## Peer Online Status
 
@@ -320,7 +378,7 @@ Use this software only with VPN configurations, networks, and systems you are au
 
 ## Search Keywords
 
-WireGuard server Windows, Windows WireGuard VPN server, WireGuard GUI server, Windows 7 WireGuard server, Windows 10 WireGuard server, Windows 11 WireGuard server, WireGuardNT server, Wintun VPN server, Native NAT PAT, VPN LAN access, Host Alias NAT, multi peer WireGuard, WireGuard QR Code, native C++ Win32 VPN server
+WireGuard server Windows, Windows WireGuard VPN server, WireGuard GUI server, Windows 7 WireGuard server, Windows 10 WireGuard server, Windows 11 WireGuard server, WireGuardNT server, Wintun VPN server, Native NAT PAT, VPN LAN access, VPN Internet gateway, full tunnel WireGuard, split tunnel WireGuard, Host Alias NAT, multi peer WireGuard, WireGuard QR Code, native C++ Win32 VPN server
 
 ---
 
@@ -340,9 +398,22 @@ EasyWG Server 是一款輕量化的 **原生 Windows WireGuard VPN Server 圖形
 
 > 本專案採 **Source Available（原始碼公開可檢視）** 模式，授權為 PolyForm Shield License 1.0.0。完整條款請參閱 [LICENSE](./LICENSE)。
 
-## 最新版本 — v0.4.7
+## 最新版本 — v0.4.9
 
-首個公開版本提供完整的 Windows WireGuard Server 操作流程，包含多 Peer 管理、QR Code 快速加入、Native NAT/PAT、Host Alias、Windows 7 Legacy 相容，以及即時 Peer 統計。
+v0.4.9 新增每位用戶獨立選擇公網上網模式，並正式啟用所有頁面左下角的服務控制按鈕。
+
+### 本次更新
+
+- 新增用戶時可獨立選擇是否透過 VPN 主機的公網 IP 上網
+  - 勾選：使用 `AllowedIPs = 0.0.0.0/0`，所有 IPv4 流量透過 VPN 主機上網
+  - 不勾選：僅允許存取 VPN 與私人區域網路，用戶原本的網際網路連線不受影響
+- 左下角服務控制按鈕現在於所有頁面都可正常操作
+  - 啟動服務
+  - 停止服務
+  - 重新啟動服務
+- Native NAT/PAT 現在可正確支援全通道用戶透過 EasyWG Server 主機連接 Internet
+- 修復新增用戶區塊中「VPN IP 最後一碼」文字被裁切的問題
+- 舊版設定檔仍可相容使用
 
 ### 主要特色
 
@@ -350,12 +421,14 @@ EasyWG Server 是一款輕量化的 **原生 Windows WireGuard VPN Server 圖形
 - 主程式超輕量
 - 支援 Windows 7 SP1 / 10 / 11 x64
 - 多 Peer / 多用戶 VPN 管理
-- 一鍵啟動 / 停止 Server
+- 每位用戶可獨立選擇僅內網或全通道公網上網
+- 一鍵啟動、停止及重新啟動 Server
 - WireGuard 金鑰本機產生
 - QR Code 本機產生
 - 個別 Peer `.conf` 設定檔匯出
 - Peer 編輯 / 匯出 / QR Code / 刪除操作
 - Native NAT/PAT，支援 VPN 存取其他 LAN 主機
+- Native NAT/PAT，支援全通道用戶透過 VPN 主機上網
 - Host Alias NAT，支援 VPN 存取 Server 自己的 LAN IP
 - LAN 存取不需要分享器 Static Route
 - 自動偵測 LAN 與公網資訊
@@ -388,6 +461,46 @@ EasyWG Server 是一款輕量化的 **原生 Windows WireGuard VPN Server 圖形
 設定頁可管理 Server、開機啟動、語言、主題、系統列與其他應用程式選項。
 
 ![EasyWG Server 中文設定](assets/screenshots/settings-zh-tw.png)
+
+## 每位用戶獨立選擇上網模式
+
+每位 Peer 都可以獨立選擇是否使用 EasyWG Server 電腦作為網際網路閘道。
+
+### 僅內網模式
+
+新增用戶時不勾選公網上網選項，匯出的設定只會包含 VPN 網段與已設定的私人 LAN 網段。
+
+例如：
+
+```ini
+AllowedIPs = 192.168.11.0/24, 10.66.66.0/24
+```
+
+Peer 可以存取 VPN 與 LAN 資源，但一般 Internet 流量仍使用 Client 原本的網路連線。
+
+### 全通道公網上網模式
+
+新增用戶時勾選公網上網選項，匯出的設定會使用：
+
+```ini
+AllowedIPs = 0.0.0.0/0
+```
+
+Peer 的 IPv4 Internet 流量會透過 VPN Server，並由 EasyWG Native NAT/PAT 轉換後，經由 Server 電腦原本的 LAN 閘道連接 Internet。
+
+```text
+VPN Client
+   ↓
+WireGuard Tunnel
+   ↓
+EasyWG Native NAT/PAT
+   ↓
+EasyWG Server LAN 網卡
+   ↓
+分享器 / Internet
+```
+
+上網模式會依每位 Peer 分別儲存。
 
 ## Windows 核心架構
 
@@ -483,6 +596,7 @@ EasyWG Server LAN IP
 - Private Key
 - Public Key
 - Preshared Key
+- 僅內網或全通道上網模式
 - 匯出的 `.conf` 設定檔
 - 本機產生的 QR Code
 
@@ -513,7 +627,7 @@ WireGuard 設定內容不會傳送到外部 QR Code API。
 3. 系統要求時允許系統管理員權限。
 4. 第一次啟動時，若缺少必要 Runtime 元件，EasyWG 會依需求自動取得。
 5. 設定 VPN 網段、UDP Listen Port 與公網 IP / DDNS。
-6. 新增 Peer。
+6. 新增 Peer，並選擇是否讓該用戶透過 VPN 主機上網。
 7. 使用 WireGuard 手機 App 掃描 QR Code，或匯出 Peer `.conf` 設定檔。
 8. 啟動 Server。
 9. 若要從外網連入，將設定的 UDP Listen Port 從分享器轉發到 EasyWG Server 的 LAN IP。
@@ -541,6 +655,8 @@ UDP 51820
 ```
 
 匯出的 Peer 設定可使用公網 IP 或 DDNS 主機名稱。
+
+> 分享器 Port Forward 是讓外部 Client 能連入 VPN Server；每位用戶的全通道選項，則是控制連線後是否也透過 VPN Server 主機上網。
 
 ## Peer 在線狀態
 
@@ -641,4 +757,4 @@ WireGuard 為其權利人的商標。
 
 ## 搜尋關鍵字
 
-WireGuard Server Windows, Windows WireGuard VPN Server, WireGuard GUI Server, Windows 7 WireGuard Server, Windows 10 WireGuard Server, Windows 11 WireGuard Server, WireGuardNT Server, Wintun VPN Server, Native NAT PAT, VPN LAN Access, Host Alias NAT, Multi Peer WireGuard, WireGuard QR Code, Native C++ Win32 VPN Server
+WireGuard Server Windows, Windows WireGuard VPN Server, WireGuard GUI Server, Windows 7 WireGuard Server, Windows 10 WireGuard Server, Windows 11 WireGuard Server, WireGuardNT Server, Wintun VPN Server, Native NAT PAT, VPN LAN Access, VPN Internet Gateway, Full Tunnel WireGuard, Split Tunnel WireGuard, Host Alias NAT, Multi Peer WireGuard, WireGuard QR Code, Native C++ Win32 VPN Server
