@@ -119,6 +119,7 @@ constexpr UINT IDC_ADD_OCTET = 4302;
 constexpr UINT IDC_ADD_CREATE = 4303;
 constexpr UINT IDC_ADD_SAVE_QR = 4304;
 constexpr UINT IDC_ADD_SAVE_CONFIG = 4305;
+constexpr UINT IDC_ADD_FULL_TUNNEL = 4306;
 constexpr UINT IDC_DASH_SCROLL = 4310;
 constexpr UINT IDC_USERS_SCROLL = 4311;
 
@@ -474,6 +475,8 @@ struct PeerInfo {
     uint64_t rx = 0;
     uint64_t tx = 0;
     uint64_t lastHandshake = 0;
+    // true: route all IPv4 traffic through EasyWG; false: only VPN/LAN /24 networks.
+    bool fullTunnel = false;
 };
 
 struct ServerSettings {
@@ -514,6 +517,7 @@ HICON gAppIconSmall = nullptr;
 int gAutoStartRetry = 0;
 
 void UpdateTrayIconTip();
+bool AllowedIpListContains(const std::wstring& list, const std::wstring& wanted);
 
 std::wstring T(const wchar_t* zh, const wchar_t* en) { return gEnglish.load() ? en : zh; }
 
@@ -557,6 +561,7 @@ void SaveConfig() {
         SetIni(sec.c_str(), L"PublicKey", Base64Encode(gPeers[i].publicKey.data(), 32));
         SetIni(sec.c_str(), L"PrivateKey", Base64Encode(gPeers[i].privateKey.data(), 32));
         SetIni(sec.c_str(), L"PresharedKey", Base64Encode(gPeers[i].presharedKey.data(), 32));
+        SetIni(sec.c_str(), L"FullTunnel", gPeers[i].fullTunnel ? L"1" : L"0");
     }
 }
 
@@ -606,6 +611,10 @@ void LoadConfig() {
         if (!Base64Decode(GetIni(sec.c_str(), L"PublicKey", L""), p.publicKey.data(), 32)) continue;
         Base64Decode(GetIni(sec.c_str(), L"PrivateKey", L""), p.privateKey.data(), 32);
         Base64Decode(GetIni(sec.c_str(), L"PresharedKey", L""), p.presharedKey.data(), 32);
+        // Existing INI files did not have FullTunnel. Preserve their old global
+        // AllowedIPs behavior during the first load, then SaveConfig writes it per user.
+        const wchar_t* legacyMode = AllowedIpListContains(gSettings.clientAllowedIPs, L"0.0.0.0/0") ? L"1" : L"0";
+        p.fullTunnel = GetIni(sec.c_str(), L"FullTunnel", legacyMode) == L"1";
         gPeers.push_back(p);
     }
 }
@@ -657,6 +666,57 @@ std::wstring EffectiveClientAllowedIPs(const ServerSettings& s) {
         }
     }
     return out.empty() ? Ipv4NetworkCidr(s.address, s.prefix) : out;
+}
+
+bool AllowedIpListContains(const std::wstring& list, const std::wstring& wanted) {
+    size_t start = 0;
+    while (start <= list.size()) {
+        const size_t comma = list.find(L',', start);
+        const std::wstring token = Trim(list.substr(
+            start, comma == std::wstring::npos ? std::wstring::npos : comma - start));
+        if (_wcsicmp(token.c_str(), wanted.c_str()) == 0) return true;
+        if (comma == std::wstring::npos) break;
+        start = comma + 1;
+    }
+    return false;
+}
+
+void AppendUniqueCidr(std::vector<std::wstring>& cidrs, const std::wstring& cidr) {
+    if (cidr.empty()) return;
+    for (const auto& old : cidrs) {
+        if (_wcsicmp(old.c_str(), cidr.c_str()) == 0) return;
+    }
+    cidrs.push_back(cidr);
+}
+
+std::wstring NormalizeIpv4Network24(const std::wstring& value) {
+    IN_ADDR address{};
+    int prefix = 0;
+    if (!ParseIpv4Cidr(value, address, prefix)) return L"";
+    wchar_t ip[64]{};
+    if (!InetNtopW(AF_INET, &address, ip, _countof(ip))) return L"";
+    return Ipv4NetworkCidr(ip, 24);
+}
+
+std::wstring JoinCidrs(const std::vector<std::wstring>& cidrs) {
+    std::wstring out;
+    for (const auto& cidr : cidrs) {
+        if (!out.empty()) out += L", ";
+        out += cidr;
+    }
+    return out;
+}
+
+std::wstring PeerClientAllowedIPs(const ServerSettings& st, const PeerInfo& peer) {
+    if (peer.fullTunnel) return L"0.0.0.0/0";
+
+    // Private-network-only profiles keep normal Internet traffic on the client.
+    // The public edition has one local LAN plus the EasyWG VPN subnet, both /24.
+    std::vector<std::wstring> cidrs;
+    AppendUniqueCidr(cidrs, NormalizeIpv4Network24(st.lanSubnet));
+    AppendUniqueCidr(cidrs, Ipv4NetworkCidr(st.address, 24));
+    if (cidrs.empty()) AppendUniqueCidr(cidrs, L"10.66.66.0/24");
+    return JoinCidrs(cidrs);
 }
 
 bool IsElevated() {
@@ -1862,18 +1922,23 @@ public:
                     L" lanCidr=" + lanCidr_ + L" lanHost=" + lanHostIpText_ +
                     L" wgIfIndex=" + std::to_wstring(wgIfIndex_));
 
-        // Keep WinDivert filters selective. This avoids diverting unrelated
-        // forwarding traffic or ordinary inbound traffic to the EasyWG process.
+        // Capture every forwarded IPv4 packet that leaves the WireGuard subnet,
+        // not only packets whose destination is inside the configured LAN.  A
+        // full-tunnel client sends public Internet destinations through WG, so
+        // those packets must receive the same PAT/SNAT as ordinary LAN access.
+        // Traffic to the EasyWG host's own LAN address remains owned by the
+        // separate Host Alias NAT path.
         UINT32 vpnEndHost = vpnNetworkHost_ | ~vpnMaskHost_;
-        UINT32 lanEndHost = lanNetworkHost_ | ~lanMaskHost_;
         std::string forwardFilter =
             "ip and !impostor and ip.SrcAddr >= " + WideToUtf8(Ipv4HostOrderToText(vpnNetworkHost_)) +
             " and ip.SrcAddr <= " + WideToUtf8(Ipv4HostOrderToText(vpnEndHost)) +
-            " and ip.DstAddr >= " + WideToUtf8(Ipv4HostOrderToText(lanNetworkHost_)) +
-            " and ip.DstAddr <= " + WideToUtf8(Ipv4HostOrderToText(lanEndHost)) +
-            " and ip.DstAddr != " + WideToUtf8(lanHostIpText_);
+            " and (ip.DstAddr < " + WideToUtf8(Ipv4HostOrderToText(vpnNetworkHost_)) +
+            " or ip.DstAddr > " + WideToUtf8(Ipv4HostOrderToText(vpnEndHost)) + ")" +
+            " and ip.DstAddr != " + WideToUtf8(lanHostIpText_) +
+            " and (tcp or udp or icmp)";
         PacketTrace(L"[FILTER] FORWARD=" + Utf8ToWide(forwardFilter));
-        PacketTrace(L"[FILTER] FORWARD excludes lanHost=" + lanHostIpText_ + L"; Host Alias owns this destination");
+        PacketTrace(L"[FILTER] FORWARD covers LAN + Internet and excludes lanHost=" +
+                    lanHostIpText_ + L"; Host Alias owns this destination");
         forward_ = api_.Open(forwardFilter.c_str(), WINDIVERT_LAYER_NETWORK_FORWARD, 100, 0);
         if (forward_ == INVALID_HANDLE_VALUE) {
             forward_ = nullptr;
@@ -1884,14 +1949,17 @@ public:
         // Replies are addressed to this Windows host after SNAT. Capture them
         // on the normal inbound network path, reverse the NAT mapping, then
         // reinject them inbound so Windows routes them to the WireGuard subnet.
-        // Only capture replies coming from the configured LAN subnet.
-        // Do NOT capture WG-client traffic sent directly to this server's own
-        // LAN IP (for example 10.66.66.2 -> 192.168.1.200). Those packets are
-        // local-host traffic, not NAT replies, and must bypass the NAT engine.
+        // The source can be either a LAN host or any public Internet address;
+        // restricting this filter to the LAN CIDR breaks full-tunnel Internet
+        // return traffic. TranslateInbound still validates every packet against
+        // the NAT state table before changing it.
+        // Exclude the VPN source subnet so requests sent directly to this
+        // server's own LAN IP continue to the separate Host Alias handle rather
+        // than being captured as possible PAT replies.
         std::string inboundFilter =
             "inbound and ip and !impostor" +
-            std::string(" and ip.SrcAddr >= ") + WideToUtf8(Ipv4HostOrderToText(lanNetworkHost_)) +
-            " and ip.SrcAddr <= " + WideToUtf8(Ipv4HostOrderToText(lanEndHost)) +
+            std::string(" and (ip.SrcAddr < ") + WideToUtf8(Ipv4HostOrderToText(vpnNetworkHost_)) +
+            " or ip.SrcAddr > " + WideToUtf8(Ipv4HostOrderToText(vpnEndHost)) + ")" +
             " and ip.DstAddr == " + WideToUtf8(lanHostIpText_) +
             " and (tcp or udp or icmp)";
         PacketTrace(L"[FILTER] INBOUND_REPLY=" + Utf8ToWide(inboundFilter));
@@ -1956,7 +2024,8 @@ public:
         aliasThread_ = std::thread([this]{ AliasLoop(); });
         PacketTrace(L"[START] NAT threads running; begin ping tests now");
         DeleteFileW(JoinPath(GetExeDir(), L"EasyWG_NAT_Error.txt").c_str());
-        AddLog(L"EasyWG Native NAT 已啟動: " + vpnCidr_ + L" -> " + lanHostIpText_ + L" -> " + lanCidr_);
+        AddLog(L"EasyWG Native NAT 已啟動: " + vpnCidr_ + L" -> " + lanHostIpText_ +
+               L" -> LAN / Internet（" + lanCidr_ + L"）");
         AddLog(L"Host Alias NAT 已啟動: " + lanHostIpText_ + L" <-> " + s.address +
                L"（固定 WG inbound/outbound 注入，不修改 WeakHost）");
         AddLog(L"NAT Backend: EasyWG PAT + Host Alias + WinDivert（不使用 Hyper-V / New-NetNat）");
@@ -2217,7 +2286,11 @@ private:
 
     bool TranslateOutbound(ParsedIpv4Packet& p) {
         if (!p.ip || !IpNetworkOrderInRange(p.ip->SrcAddr, vpnNetworkHost_, vpnMaskHost_) ||
-            !IpNetworkOrderInRange(p.ip->DstAddr, lanNetworkHost_, lanMaskHost_)) return false;
+            IpNetworkOrderInRange(p.ip->DstAddr, vpnNetworkHost_, vpnMaskHost_)) return false;
+
+        // The generic PAT path now covers both configured LAN destinations and
+        // public Internet destinations. Client-side AllowedIPs decides whether
+        // a peer sends only private networks or uses the full 0.0.0.0/0 tunnel.
 
         // The EasyWG host's own LAN IP must never be handled by the generic
         // forward SNAT path.  It is reserved for Host Alias NAT instead.
@@ -3418,7 +3491,7 @@ void DrawQuickActionIcon(HDC dc,HICON icon,const RectI& r){
 
 int gPage=0;
 HWND gMainWnd=nullptr;
-RectI gStartStopBtn{},gAddPeerBtn{},gExportBtn{},gRestartBtn{},gQuickAdd{},gQuickQr{},gQuickExport{},gQuickBackup{};
+RectI gStartStopBtn{},gSidebarRestartBtn{},gSidebarToggleBtn{},gAddPeerBtn{},gExportBtn{},gRestartBtn{},gQuickAdd{},gQuickQr{},gQuickExport{},gQuickBackup{};
 RectI gUserExportBtn{},gUserQrBtn{},gGitHubBtn{};
 std::vector<RectI> gNavRects;
 std::vector<RectI> gDashboardPeerActionRects;
@@ -3426,6 +3499,7 @@ std::vector<RectI> gUserPeerActionRects;
 
 // Inline Add User panel embedded in the dashboard (no floating window).
 HWND gAddNameEdit=nullptr,gAddOctetEdit=nullptr,gAddCreateBtn=nullptr;
+HWND gAddFullTunnelCheck=nullptr;
 HWND gAddSaveQrBtn=nullptr,gAddSaveConfigBtn=nullptr;
 HWND gAddPrefixLabel=nullptr;
 bool gInlineAddVisible=true;
@@ -3735,13 +3809,13 @@ void DrawSidebar(HDC dc,int h){
                     :gRunning?T(L"已執行 ",L"Uptime ")+RuntimeText()
                              :T(L"尚未啟動",L"Not started"),
          30,h-188,160,25,gFonts.smallFont,CLR_MUTED);
-    RectI rb{30,h-151,150,34};
-    DrawButton(dc,rb,T(L"重新啟動服務",L"Restart Service"));
-    RectI sb{30,h-108,150,34};
-    DrawButton(dc,sb,starting?T(L"啟動中...",L"Starting...")
-                             :stopping?T(L"停止中...",L"Stopping...")
-                             :gRunning?T(L"停止服務",L"Stop Service")
-                                      :T(L"啟動服務",L"Start Service"),false,gRunning&&!stopping);
+    gSidebarRestartBtn={30,h-151,150,34};
+    DrawButton(dc,gSidebarRestartBtn,T(L"重新啟動服務",L"Restart Service"));
+    gSidebarToggleBtn={30,h-108,150,34};
+    DrawButton(dc,gSidebarToggleBtn,starting?T(L"啟動中...",L"Starting...")
+                                           :stopping?T(L"停止中...",L"Stopping...")
+                                           :gRunning?T(L"停止服務",L"Stop Service")
+                                                    :T(L"啟動服務",L"Start Service"),false,gRunning&&!stopping);
 
     Line(dc,18,h-58,212,h-58,CLR_BORDER);
     Text(dc,L"EasyWG Server © 2026",22,h-55,186,24,gFonts.smallFont,CLR_MUTED);
@@ -3907,10 +3981,10 @@ void DrawDashboard(HDC dc,int w,int h){
         Line(dc,panel.x,panel.y+50,panel.x+panel.w,panel.y+50,CLR_BORDER);
 
         Text(dc,T(L"用戶名稱",L"User Name"),panel.x+20,panel.y+66,panel.w-40,24,gFonts.bold,CLR_TEXT);
-        Text(dc,T(L"VPN IP 最後一碼",L"VPN IP last octet"),panel.x+20,panel.y+130,panel.w-40,24,gFonts.bold,CLR_TEXT);
+        Text(dc,T(L"VPN IP 最後一碼",L"VPN IP last octet"),panel.x+20,panel.y+136,145,36,gFonts.bold,CLR_TEXT,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
 
-        // Green information/result card, similar to the guided add-user flow.
-        RectI info{panel.x+16,panel.y+258,panel.w-32,102};
+        // Leave room for the per-user public-IP/full-tunnel option.
+        RectI info{panel.x+16,panel.y+316,panel.w-32,102};
         RoundFill(dc,info,CLR_GREEN_LIGHT,C(0xBFEBD0),10);
         Dot(dc,info.x+24,info.y+26,11,CLR_GREEN);
         HPEN cp=CreatePen(PS_SOLID,2,RGB(255,255,255));
@@ -3930,7 +4004,11 @@ void DrawDashboard(HDC dc,int w,int h){
             Text(dc,T(L"✓ 預共享金鑰 (Preshared Key)",L"✓ Preshared Key"),info.x+22,info.y+64,info.w-44,22,gFonts.smallFont,CLR_GREEN,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
         }
 
-        RectI qrBox{panel.x+20,panel.y+376,panel.w-40,(std::min)(300,(std::max)(180,panel.h-590))};
+        const int saveButtonsY=panel.y+panel.h-50;
+        RectI hint{panel.x+20,saveButtonsY-62,panel.w-40,48};
+        const int qrTop=panel.y+434;
+        const int qrBottom=hint.y-12;
+        RectI qrBox{panel.x+20,qrTop,panel.w-40,(std::max)(180,qrBottom-qrTop)};
         RoundFill(dc,qrBox,RGB(255,255,255),C(0xD7E0EC),10);
         if(panelPeerOk&&gAddPanelQr.size>0){
             int qrSize=(std::min)(qrBox.w-30,qrBox.h-30);
@@ -3941,7 +4019,6 @@ void DrawDashboard(HDC dc,int w,int h){
             Text(dc,T(L"新增後將在此顯示 QR Code",L"The QR Code will appear here after creation"),qrBox.x+20,qrBox.y+qrBox.h/2+30,qrBox.w-40,45,gFonts.smallFont,CLR_MUTED,DT_CENTER|DT_WORDBREAK);
         }
 
-        RectI hint{panel.x+20,qrBox.y+qrBox.h+12,panel.w-40,48};
         RoundFill(dc,hint,CLR_BLUE_LIGHT,C(0xCFE0FF),9);
         Dot(dc,hint.x+22,hint.y+24,10,CLR_BLUE);
         Text(dc,L"i",hint.x+16,hint.y+9,12,30,gFonts.bold,RGB(255,255,255),DT_CENTER|DT_VCENTER|DT_SINGLELINE);
@@ -4149,10 +4226,11 @@ void DrawSimplePage(HDC dc,int w,int h,int page){
 
 // ---------------- Modal input windows / peer actions ----------------
 
-struct ModalResult { bool ok=false; std::wstring a,b; };
+struct ModalResult { bool ok=false; bool fullTunnel=false; std::wstring a,b; };
 ModalResult gModalResult;
 HWND gEdits[2]{};
 HWND gPeerListBox=nullptr;
+HWND gModalFullTunnelCheck=nullptr;
 int gModalMode=0;
 int gPeerChoice=-1;
 std::wstring gModalInitialA;
@@ -4166,18 +4244,25 @@ LRESULT CALLBACK ModalProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         HFONT f=gFonts.normal;
         if(gModalMode==1){
             HWND lab=CreateWindowW(L"STATIC",T(L"用戶名稱",L"User Name").c_str(),WS_CHILD|WS_VISIBLE,
-                                   22,30,440,22,hwnd,nullptr,nullptr,nullptr);
+                                   22,24,440,22,hwnd,nullptr,nullptr,nullptr);
             SendMessageW(lab,WM_SETFONT,(WPARAM)f,TRUE);
             gEdits[0]=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"New Device",
-                                      WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL,22,58,440,36,hwnd,
+                                      WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL,22,50,440,36,hwnd,
                                       (HMENU)(INT_PTR)100,nullptr,nullptr);
             SendMessageW(gEdits[0],WM_SETFONT,(WPARAM)f,TRUE);
             std::wstring autoIp=T(L"VPN IP 將自動分配未占用位址：",L"VPN IP will be assigned automatically: ")+NextPeerIp();
-            HWND ipn=CreateWindowW(L"STATIC",autoIp.c_str(),WS_CHILD|WS_VISIBLE,22,112,440,28,hwnd,nullptr,nullptr,nullptr);
+            HWND ipn=CreateWindowW(L"STATIC",autoIp.c_str(),WS_CHILD|WS_VISIBLE,22,101,440,28,hwnd,nullptr,nullptr,nullptr);
             SendMessageW(ipn,WM_SETFONT,(WPARAM)gFonts.smallFont,TRUE);
+            gModalFullTunnelCheck=CreateWindowW(L"BUTTON",
+                T(L"需使用 VPN 主機公網 IP 上網\r\n（不勾選仍可連接內網）",
+                  L"Use the VPN server's public IP for Internet access\r\n(Unchecked still allows private-network access)").c_str(),
+                WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX|BS_MULTILINE,
+                22,137,440,66,hwnd,(HMENU)(INT_PTR)130,nullptr,nullptr);
+            SendMessageW(gModalFullTunnelCheck,WM_SETFONT,(WPARAM)gFonts.bold,TRUE);
+            SendMessageW(gModalFullTunnelCheck,BM_SETCHECK,BST_UNCHECKED,0);
             HWND n=CreateWindowW(L"STATIC",T(L"Private Key、Public Key 與 Preshared Key 也會自動產生。",
                                                L"Private/Public/Preshared keys will also be generated automatically.").c_str(),
-                                 WS_CHILD|WS_VISIBLE,22,148,440,44,hwnd,nullptr,nullptr,nullptr);
+                                 WS_CHILD|WS_VISIBLE,22,216,440,44,hwnd,nullptr,nullptr,nullptr);
             SendMessageW(n,WM_SETFONT,(WPARAM)gFonts.smallFont,TRUE);
         }else if(gModalMode==2){
             std::wstring labs[]={T(L"用戶名稱",L"User Name"),T(L"VPN IP 位址",L"VPN IP Address")};
@@ -4211,7 +4296,7 @@ LRESULT CALLBACK ModalProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             if(!peers.empty())SendMessageW(gPeerListBox,LB_SETCURSEL,0,0);
         }
 
-        int y=gModalMode==1?210:(gModalMode==2?238:278);
+        int y=gModalMode==1?286:(gModalMode==2?238:278);
         std::wstring okText=gModalMode==1?T(L"產生金鑰與設定",L"Create User"):
                               (gModalMode==2?T(L"儲存修改",L"Save Changes"):T(L"確定",L"OK"));
         RECT cr{};GetClientRect(hwnd,&cr);
@@ -4231,6 +4316,8 @@ LRESULT CALLBACK ModalProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 wchar_t b[2048]{};
                 GetWindowTextW(gEdits[0],b,_countof(b));gModalResult.a=Trim(b);
                 gModalResult.b=NextPeerIp();
+                gModalResult.fullTunnel=gModalFullTunnelCheck&&
+                    SendMessageW(gModalFullTunnelCheck,BM_GETCHECK,0,0)==BST_CHECKED;
                 gModalResult.ok=true;DestroyWindow(hwnd);return 0;
             }
             if(gModalMode==2){
@@ -4265,6 +4352,16 @@ LRESULT CALLBACK ModalProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         HDC dc=(HDC)wp;SetTextColor(dc,CLR_TEXT);SetBkColor(dc,CLR_SUBTLE);
         return (LRESULT)gThemeSubtleBrush;
     }
+    case WM_CTLCOLORBTN:{
+        HDC dc=(HDC)wp;HWND ctl=(HWND)lp;
+        if(ctl==gModalFullTunnelCheck){
+            SetBkMode(dc,TRANSPARENT);
+            SetTextColor(dc,gDarkTheme?C(0xA99CFF):C(0x4F46C8));
+            return (LRESULT)gThemeSubtleBrush;
+        }
+        SetTextColor(dc,CLR_TEXT);SetBkColor(dc,CLR_SUBTLE);
+        return (LRESULT)gThemeSubtleBrush;
+    }
     case WM_ERASEBKGND:{
         HDC dc=(HDC)wp;RECT rc{};GetClientRect(hwnd,&rc);
         FillRect(dc,&rc,gThemeSubtleBrush?gThemeSubtleBrush:(HBRUSH)(COLOR_WINDOW+1));
@@ -4276,8 +4373,8 @@ LRESULT CALLBACK ModalProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
 }
 
 ModalResult ShowModal(HWND owner,int mode){
-    gModalResult={};ZeroMemory(gEdits,sizeof(gEdits));
-    int w=500,h=(mode==1?340:(mode==2?380:410));
+    gModalResult={};ZeroMemory(gEdits,sizeof(gEdits));gModalFullTunnelCheck=nullptr;
+    int w=500,h=(mode==1?410:(mode==2?380:410));
     RECT orc{};GetWindowRect(owner,&orc);
     int x=orc.left+(orc.right-orc.left-w)/2,y=orc.top+(orc.bottom-orc.top-h)/2;
     std::wstring title=mode==1?T(L"新增用戶",L"Add User"):
@@ -4296,7 +4393,7 @@ ModalResult ShowModal(HWND owner,int mode){
 
 int ChoosePeer(HWND owner){size_t n;{std::lock_guard<std::mutex>lk(gDataMutex);n=gPeers.size();}if(!n){MessageBoxW(owner,T(L"目前沒有用戶。",L"No users available.").c_str(),kAppName,MB_ICONINFORMATION);return -1;}if(n==1)return 0;gPeerChoice=-1;ShowModal(owner,3);return gPeerChoice;}
 
-bool CreatePeerRecord(HWND hwnd,const std::wstring& name,const std::wstring& ip,size_t* outIndex=nullptr){
+bool CreatePeerRecord(HWND hwnd,const std::wstring& name,const std::wstring& ip,bool fullTunnel,size_t* outIndex=nullptr){
     if(name.empty()||ip.empty()){
         MessageBoxW(hwnd,T(L"名稱與 VPN IP 不可空白。",L"Name and VPN IP are required.").c_str(),kAppName,MB_ICONWARNING);return false;
     }
@@ -4313,7 +4410,7 @@ bool CreatePeerRecord(HWND hwnd,const std::wstring& name,const std::wstring& ip,
             return false;
         }
     }
-    PeerInfo peer;peer.name=name;peer.ip=ip;
+    PeerInfo peer;peer.name=name;peer.ip=ip;peer.fullTunnel=fullTunnel;
     if(!GenerateKeyPair(peer.publicKey.data(),peer.privateKey.data())||!RandomKey(peer.presharedKey.data())){
         MessageBoxW(hwnd,T(L"金鑰產生失敗。",L"Key generation failed.").c_str(),kAppName,MB_ICONERROR);return false;
     }
@@ -4325,7 +4422,8 @@ bool CreatePeerRecord(HWND hwnd,const std::wstring& name,const std::wstring& ip,
         gPeers.push_back(peer);idx=gPeers.size()-1;
     }
     SaveConfig();
-    AddLog(T(L"新增用戶: ",L"Added user: ")+peer.name+L" ("+peer.ip+L")");
+    AddLog(T(L"新增用戶: ",L"Added user: ")+peer.name+L" ("+peer.ip+L") - "+
+           (peer.fullTunnel?T(L"公網上網",L"full tunnel"):T(L"僅內網",L"private networks only")));
     if(gRunning){StopServer();std::wstring e;if(!StartServer(e))MessageBoxW(hwnd,e.c_str(),kAppName,MB_ICONERROR);}
     if(outIndex)*outIndex=idx;
     if(gMainWnd)InvalidateRect(gMainWnd,nullptr,TRUE);
@@ -4334,7 +4432,7 @@ bool CreatePeerRecord(HWND hwnd,const std::wstring& name,const std::wstring& ip,
 
 void AddPeerUi(HWND hwnd){
     auto r=ShowModal(hwnd,1);if(!r.ok)return;
-    CreatePeerRecord(hwnd,r.a,r.b,nullptr);
+    CreatePeerRecord(hwnd,r.a,r.b,r.fullTunnel,nullptr);
 }
 
 void EditPeerUi(HWND hwnd,size_t idx){
@@ -4396,7 +4494,8 @@ void RemovePeerUi(HWND hwnd,size_t idx){
 
 std::wstring BuildPeerConfigText(size_t idx){
     ServerSettings st;PeerInfo p;{std::lock_guard<std::mutex>lk(gDataMutex);if(idx>=gPeers.size())return L"";st=gSettings;p=gPeers[idx];}
-    std::wstringstream ss;ss<<L"[Interface]\r\nPrivateKey = "<<Base64Encode(p.privateKey.data(),32)<<L"\r\nAddress = "<<p.ip<<L"/32\r\n";if(!st.dns.empty())ss<<L"DNS = "<<st.dns<<L"\r\n";ss<<L"\r\n[Peer]\r\nPublicKey = "<<Base64Encode(st.publicKey.data(),32)<<L"\r\nPresharedKey = "<<Base64Encode(p.presharedKey.data(),32)<<L"\r\nEndpoint = "<<(st.endpoint.empty()?L"<PUBLIC-IP-OR-DDNS>":st.endpoint)<<L":"<<st.port<<L"\r\nAllowedIPs = "<<EffectiveClientAllowedIPs(st)<<L"\r\nPersistentKeepalive = 25\r\n";return ss.str();
+    const std::wstring allowed=PeerClientAllowedIPs(st,p);
+    std::wstringstream ss;ss<<L"[Interface]\r\nPrivateKey = "<<Base64Encode(p.privateKey.data(),32)<<L"\r\nAddress = "<<p.ip<<L"/32\r\n";if(!st.dns.empty())ss<<L"DNS = "<<st.dns<<L"\r\n";ss<<L"\r\n[Peer]\r\nPublicKey = "<<Base64Encode(st.publicKey.data(),32)<<L"\r\nPresharedKey = "<<Base64Encode(p.presharedKey.data(),32)<<L"\r\nEndpoint = "<<(st.endpoint.empty()?L"<PUBLIC-IP-OR-DDNS>":st.endpoint)<<L":"<<st.port<<L"\r\nAllowedIPs = "<<allowed<<L"\r\nPersistentKeepalive = 25\r\n";return ss.str();
 }
 
 bool ExportPeerConfig(HWND hwnd,size_t idx){
@@ -4473,6 +4572,7 @@ void RefreshAddPanelDefaults(){
     if(gAddNameEdit)SetWindowTextW(gAddNameEdit,T(L"New Device",L"New Device").c_str());
     if(gAddOctetEdit)SetWindowTextW(gAddOctetEdit,SuggestedLastOctet().c_str());
     if(gAddPrefixLabel)SetWindowTextW(gAddPrefixLabel,VpnPrefix3().c_str());
+    if(gAddFullTunnelCheck)SendMessageW(gAddFullTunnelCheck,BM_SETCHECK,BST_UNCHECKED,0);
 }
 
 RectI InlineAddPanelRect(HWND hwnd){
@@ -4482,7 +4582,7 @@ RectI InlineAddPanelRect(HWND hwnd){
 
 void ShowInlineAddControls(bool show){
     int cmd=show?SW_SHOW:SW_HIDE;
-    HWND ctrls[]={gAddNameEdit,gAddOctetEdit,gAddCreateBtn,gAddPrefixLabel,gAddSaveQrBtn,gAddSaveConfigBtn};
+    HWND ctrls[]={gAddNameEdit,gAddOctetEdit,gAddCreateBtn,gAddPrefixLabel,gAddFullTunnelCheck,gAddSaveQrBtn,gAddSaveConfigBtn};
     for(HWND c:ctrls)if(c)ShowWindow(c,cmd);
     bool ready=show&&gAddPanelPeerIndex>=0&&gAddPanelQr.size>0;
     if(gAddSaveQrBtn)EnableWindow(gAddSaveQrBtn,ready?TRUE:FALSE);
@@ -4494,9 +4594,10 @@ void LayoutInlineAddControls(HWND hwnd){
     RectI p=InlineAddPanelRect(hwnd);
     int mx=p.x+20,inner=p.w-40;
     if(gAddNameEdit)MoveWindow(gAddNameEdit,mx,p.y+92,inner,34,TRUE);
-    if(gAddPrefixLabel)MoveWindow(gAddPrefixLabel,mx,p.y+158,inner-86,36,TRUE);
-    if(gAddOctetEdit)MoveWindow(gAddOctetEdit,p.x+p.w-100,p.y+158,80,36,TRUE);
-    if(gAddCreateBtn)MoveWindow(gAddCreateBtn,mx,p.y+208,inner,42,TRUE);
+    if(gAddPrefixLabel)MoveWindow(gAddPrefixLabel,p.x+169,p.y+136,p.w-269,36,TRUE);
+    if(gAddOctetEdit)MoveWindow(gAddOctetEdit,p.x+p.w-100,p.y+136,80,36,TRUE);
+    if(gAddFullTunnelCheck)MoveWindow(gAddFullTunnelCheck,mx,p.y+180,inner,68,TRUE);
+    if(gAddCreateBtn)MoveWindow(gAddCreateBtn,mx,p.y+258,inner,42,TRUE);
     if(gAddSaveQrBtn)MoveWindow(gAddSaveQrBtn,mx,p.y+p.h-50,(inner-10)/2,36,TRUE);
     if(gAddSaveConfigBtn)MoveWindow(gAddSaveConfigBtn,mx+(inner-10)/2+10,p.y+p.h-50,(inner-10)/2,36,TRUE);
     ShowInlineAddControls(true);
@@ -4507,10 +4608,15 @@ void CreateInlineAddControls(HWND owner){
     gAddNameEdit=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"New Device",WS_CHILD|ES_AUTOHSCROLL,0,0,100,34,owner,(HMENU)(INT_PTR)IDC_ADD_NAME,nullptr,nullptr);
     gAddPrefixLabel=CreateWindowW(L"STATIC",L"10.66.66.",WS_CHILD|SS_RIGHT,0,0,100,36,owner,nullptr,nullptr,nullptr);
     gAddOctetEdit=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"2",WS_CHILD|ES_NUMBER|ES_CENTER,0,0,80,36,owner,(HMENU)(INT_PTR)IDC_ADD_OCTET,nullptr,nullptr);
+    gAddFullTunnelCheck=CreateWindowW(L"BUTTON",
+        T(L"需使用 VPN 主機公網 IP 上網\r\n（不勾選仍可連接內網）",
+          L"Use VPN server public IP for Internet\r\n(Unchecked still allows private-network access)").c_str(),
+        WS_CHILD|WS_TABSTOP|BS_AUTOCHECKBOX|BS_MULTILINE,0,0,100,48,owner,
+        (HMENU)(INT_PTR)IDC_ADD_FULL_TUNNEL,nullptr,nullptr);
     gAddCreateBtn=CreateWindowW(L"BUTTON",T(L"新增用戶",L"Add User").c_str(),WS_CHILD|BS_OWNERDRAW,0,0,100,42,owner,(HMENU)(INT_PTR)IDC_ADD_CREATE,nullptr,nullptr);
     gAddSaveQrBtn=CreateWindowW(L"BUTTON",T(L"儲存 QR Code",L"Save QR Code").c_str(),WS_CHILD|BS_OWNERDRAW,0,0,100,36,owner,(HMENU)(INT_PTR)IDC_ADD_SAVE_QR,nullptr,nullptr);
     gAddSaveConfigBtn=CreateWindowW(L"BUTTON",T(L"儲存設定檔",L"Save Config").c_str(),WS_CHILD|BS_OWNERDRAW,0,0,100,36,owner,(HMENU)(INT_PTR)IDC_ADD_SAVE_CONFIG,nullptr,nullptr);
-    for(HWND c:{gAddNameEdit,gAddPrefixLabel,gAddOctetEdit,gAddCreateBtn,gAddSaveQrBtn,gAddSaveConfigBtn})if(c)SendMessageW(c,WM_SETFONT,(WPARAM)(c==gAddPrefixLabel||c==gAddOctetEdit?gFonts.h2:(c==gAddCreateBtn||c==gAddSaveQrBtn||c==gAddSaveConfigBtn?gFonts.bold:f)),TRUE);
+    for(HWND c:{gAddNameEdit,gAddPrefixLabel,gAddOctetEdit,gAddFullTunnelCheck,gAddCreateBtn,gAddSaveQrBtn,gAddSaveConfigBtn})if(c)SendMessageW(c,WM_SETFONT,(WPARAM)(c==gAddPrefixLabel||c==gAddOctetEdit?gFonts.h2:(c==gAddFullTunnelCheck?gFonts.bold:(c==gAddCreateBtn||c==gAddSaveQrBtn||c==gAddSaveConfigBtn?gFonts.bold:f))),TRUE);
     RefreshAddPanelDefaults();
     ShowInlineAddControls(false);
 }
@@ -4600,6 +4706,33 @@ void ToggleServer(HWND hwnd){
     UpdateTrayIconTip();
     InvalidateRect(hwnd,nullptr,TRUE);
     UpdateWindow(hwnd);
+    std::wstring err;
+    const bool ok=StartServer(err);
+    gServerTransition=SERVER_TRANSITION_IDLE;
+    UpdateTrayIconTip();
+    InvalidateRect(hwnd,nullptr,TRUE);
+    UpdateWindow(hwnd);
+    if(!ok)MessageBoxW(hwnd,err.c_str(),kAppName,MB_ICONERROR);
+}
+
+void RestartServerUi(HWND hwnd){
+    if(gServerTransition.load()!=SERVER_TRANSITION_IDLE)return;
+    if(!gRunning){
+        ToggleServer(hwnd);
+        return;
+    }
+
+    gServerTransition=SERVER_TRANSITION_STOPPING;
+    UpdateTrayIconTip();
+    InvalidateRect(hwnd,nullptr,TRUE);
+    UpdateWindow(hwnd);
+    StopServer();
+
+    gServerTransition=SERVER_TRANSITION_STARTING;
+    UpdateTrayIconTip();
+    InvalidateRect(hwnd,nullptr,TRUE);
+    UpdateWindow(hwnd);
+
     std::wstring err;
     const bool ok=StartServer(err);
     gServerTransition=SERVER_TRANSITION_IDLE;
@@ -4797,7 +4930,9 @@ LRESULT CALLBACK MainProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             try{n=std::stoi(oct);}catch(...){n=0;}
             if(n<2||n>254){MessageBoxW(hwnd,T(L"VPN IP 最後一碼請輸入 2～254。",L"Enter a VPN IP last octet from 2 to 254.").c_str(),kAppName,MB_ICONWARNING);return 0;}
             std::wstring ip=VpnPrefix3()+std::to_wstring(n);size_t idx=0;
-            if(CreatePeerRecord(hwnd,name,ip,&idx)){
+            const bool fullTunnel=gAddFullTunnelCheck&&
+                SendMessageW(gAddFullTunnelCheck,BM_GETCHECK,0,0)==BST_CHECKED;
+            if(CreatePeerRecord(hwnd,name,ip,fullTunnel,&idx)){
                 gAddPanelPeerIndex=(int)idx;std::string err;gAddPanelQr={};
                 if(!miniqr::EncodeUtf8(WideToUtf8(BuildPeerConfigText(idx)),gAddPanelQr,err))AddLog(T(L"新增後 QR 產生失敗: ",L"QR generation after add failed: ")+Utf8ToWide(err));
                 RefreshAddPanelDefaults();
@@ -4852,6 +4987,11 @@ LRESULT CALLBACK MainProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_CTLCOLORBTN:{
         HDC dc=(HDC)wp;HWND ctl=(HWND)lp;
+        if(ctl==gAddFullTunnelCheck){
+            SetBkMode(dc,TRANSPARENT);
+            SetTextColor(dc,gDarkTheme?C(0xA99CFF):C(0x4F46C8));
+            return (LRESULT)gThemeCardBrush;
+        }
         if(ctl==gSetCloseToTray||ctl==gSetStartWindows||ctl==gSetAutoServer){
             SetTextColor(dc,CLR_TEXT);SetBkColor(dc,CLR_CARD);return (LRESULT)gThemeCardBrush;
         }
@@ -4884,6 +5024,16 @@ LRESULT CALLBACK MainProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
 
     case WM_LBUTTONUP:{
         int x=GET_X_LPARAM(lp),y=GET_Y_LPARAM(lp);
+
+        // These custom-drawn sidebar controls are available on every page.
+        if(PtIn(gSidebarRestartBtn,x,y)){
+            RestartServerUi(hwnd);
+            return 0;
+        }
+        if(PtIn(gSidebarToggleBtn,x,y)){
+            ToggleServer(hwnd);
+            return 0;
+        }
 
         for(size_t i=0;i<gNavRects.size();++i){
             if(PtIn(gNavRects[i],x,y)){
